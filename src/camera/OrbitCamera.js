@@ -1,17 +1,16 @@
 import { mat4, vec3 } from 'gl-matrix';
 
 /**
- * Orbit camera that rotates around a target point using spherical coordinates.
- * Supports rotate (left drag), zoom (wheel), and pan (right drag / shift+left).
+ * Orbit camera for HW5 mesh viewer.
  */
 export class OrbitCamera {
   constructor() {
-    this.target = vec3.fromValues(0, 4, 0);
-    this.distance = 90;
-    this.azimuth = Math.PI * 0.25;
-    this.elevation = 0.45;
-    this.minDistance = 15;
-    this.maxDistance = 200;
+    this.target = vec3.fromValues(0, 0, 0);
+    this.distance = 4;
+    this.azimuth = Math.PI * 0.3;
+    this.elevation = 0.4;
+    this.minDistance = 1;
+    this.maxDistance = 30;
     this.minElevation = 0.05;
     this.maxElevation = Math.PI / 2 - 0.05;
 
@@ -37,8 +36,10 @@ export class OrbitCamera {
     };
   }
 
-  updateProjection(aspect, fov = Math.PI / 4, near = 0.5, far = 500) {
-    mat4.perspective(this.projectionMatrix, fov, aspect, near, far);
+  updateProjection(aspect, fov = Math.PI / 4, near = 0.1, far = 100) {
+    mat4.perspectiveZO(this.projectionMatrix, fov, aspect, near, far);
+    // WebGPU clip-space Y points down (unlike OpenGL).
+    this.projectionMatrix[5] *= -1;
   }
 
   update() {
@@ -57,17 +58,8 @@ export class OrbitCamera {
     this.normalMatrix = mat3FromMat4(this.modelMatrix);
   }
 
-  reset() {
-    this.target = vec3.fromValues(0, 4, 0);
-    this.distance = 90;
-    this.azimuth = Math.PI * 0.25;
-    this.elevation = 0.45;
-    this.update();
-  }
-
   attach(canvas) {
     this._canvas = canvas;
-
     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
     canvas.addEventListener('mousedown', this._onMouseDown);
     canvas.addEventListener('mousemove', this._onMouseMove);
@@ -115,11 +107,9 @@ export class OrbitCamera {
       const cosAz = Math.cos(this.azimuth);
       const sinAz = Math.sin(this.azimuth);
       const right = [-cosAz, 0, sinAz];
-      const up = [0, 1, 0];
-
-      this.target[0] -= right[0] * dx * panSpeed + up[0] * dy * panSpeed;
-      this.target[1] -= right[1] * dx * panSpeed + up[1] * dy * panSpeed;
-      this.target[2] -= right[2] * dx * panSpeed + up[2] * dy * panSpeed;
+      this.target[0] -= right[0] * dx * panSpeed;
+      this.target[1] -= dy * panSpeed;
+      this.target[2] -= right[2] * dx * panSpeed;
     }
 
     this.update();
@@ -138,9 +128,6 @@ export class OrbitCamera {
   };
 }
 
-/**
- * Extract a 3x3 normal matrix from the model matrix (upper-left rotation part).
- */
 function mat3FromMat4(m) {
   return new Float32Array([
     m[0], m[1], m[2],

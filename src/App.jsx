@@ -1,13 +1,18 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { WebGPURenderer } from './renderer/WebGPURenderer.js';
-import { TERRAIN_DEFAULTS } from './terrain/TerrainGenerator.js';
+import { DEFAULT_POINT_LIGHT, DEFAULT_MATERIAL } from './lighting/defaults.js';
 import Controls from './ui/Controls.jsx';
 import StatusBar from './ui/StatusBar.jsx';
 
 const INITIAL_LIGHT = {
-  direction: [-0.4, -0.8, -0.3],
-  intensity: 1.2,
-  shininess: 48,
+  position: [...DEFAULT_POINT_LIGHT.position],
+  ambient: [...DEFAULT_POINT_LIGHT.ambient],
+  diffuse: [...DEFAULT_POINT_LIGHT.diffuse],
+  specular: [...DEFAULT_POINT_LIGHT.specular],
+  materialAmbient: [...DEFAULT_MATERIAL.ambient],
+  materialDiffuse: [...DEFAULT_MATERIAL.diffuse],
+  materialSpecular: [...DEFAULT_MATERIAL.specular],
+  shininess: DEFAULT_MATERIAL.shininess,
 };
 
 export default function App() {
@@ -19,43 +24,54 @@ export default function App() {
     vertexCount: 0,
     triangleCount: 0,
     renderMode: 'phong',
+    meshName: 'sphere',
     webgpuStatus: 'initializing',
   });
 
-  const [terrainSettings, setTerrainSettings] = useState({ ...TERRAIN_DEFAULTS });
+  const [meshName, setMeshName] = useState('sphere');
+  const [shadingMode, setShadingMode] = useState('phong');
+  const [showDebugVectors, setShowDebugVectors] = useState(false);
   const [lightSettings, setLightSettings] = useState({ ...INITIAL_LIGHT });
-  const [renderMode, setRenderMode] = useState('phong');
   const [wireframeEnabled, setWireframeEnabled] = useState(false);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    let disposed = false;
     const renderer = new WebGPURenderer(canvas);
     rendererRef.current = renderer;
 
-    renderer.onStatsUpdate((s) => setStats(s));
-
-    renderer.init().then((ok) => {
-      if (!ok) setWebgpuError(renderer.error);
+    renderer.onStatsUpdate((s) => {
+      if (disposed) return;
+      setStats(s);
+      if (s.webgpuStatus === 'error' && s.errorMessage) {
+        setWebgpuError(s.errorMessage);
+      }
     });
 
     const onResize = () => renderer.resize();
-    window.addEventListener('resize', onResize);
+
+    renderer.init().then((ok) => {
+      if (disposed) return;
+      if (!ok) setWebgpuError(renderer.error);
+
+      const resizeObserver = new ResizeObserver(() => renderer.resize());
+      resizeObserver.observe(canvas);
+      window.addEventListener('resize', onResize);
+      renderer._resizeObserver = resizeObserver;
+      renderer._onResize = onResize;
+    });
 
     return () => {
-      window.removeEventListener('resize', onResize);
+      disposed = true;
+      renderer._resizeObserver?.disconnect();
+      if (renderer._onResize) {
+        window.removeEventListener('resize', renderer._onResize);
+      }
       renderer.destroy();
       rendererRef.current = null;
     };
-  }, []);
-
-  const updateTerrain = useCallback((partial) => {
-    setTerrainSettings((prev) => {
-      const next = { ...prev, ...partial };
-      rendererRef.current?.setTerrainSettings(partial);
-      return next;
-    });
   }, []);
 
   const updateLight = useCallback((partial) => {
@@ -66,22 +82,16 @@ export default function App() {
     });
   }, []);
 
-  const handleRenderMode = useCallback((mode) => {
-    setRenderMode(mode);
-    rendererRef.current?.setRenderMode(mode);
-  }, []);
-
-  const handleWireframe = useCallback((enabled) => {
-    setWireframeEnabled(enabled);
-    rendererRef.current?.setWireframeEnabled(enabled);
-  }, []);
-
-  const handleRegenerate = useCallback(() => {
-    rendererRef.current?.regenerateTerrain();
-  }, []);
-
-  const handleResetCamera = useCallback(() => {
-    rendererRef.current?.resetCamera();
+  const updateMaterial = useCallback((partial) => {
+    setLightSettings((prev) => {
+      const next = { ...prev };
+      if (partial.ambient) next.materialAmbient = [...partial.ambient];
+      if (partial.diffuse) next.materialDiffuse = [...partial.diffuse];
+      if (partial.specular) next.materialSpecular = [...partial.specular];
+      if (partial.shininess !== undefined) next.shininess = partial.shininess;
+      rendererRef.current?.setMaterialSettings(partial);
+      return next;
+    });
   }, []);
 
   return (
@@ -89,33 +99,46 @@ export default function App() {
       <canvas ref={canvasRef} className="webgpu-canvas" />
 
       <header className="title-bar">
-        <h1>TerraGPU</h1>
-        <p>Interactive Procedural Terrain Explorer</p>
+        <h1>HW5 WebGPU</h1>
+        <p>Phong lighting — ported from nanorender</p>
       </header>
 
       {webgpuError ? (
         <div className="error-overlay">
           <div className="error-card">
-            <h2>WebGPU Not Available</h2>
+            <h2>WebGPU Error</h2>
             <p>{webgpuError}</p>
             <p className="error-hint">
-              Please use Chrome 113+, Edge 113+, or another WebGPU-capable browser with hardware
-              acceleration enabled.
+              Use Chrome 113+ or Edge 113+ with hardware acceleration enabled.
             </p>
           </div>
         </div>
       ) : (
         <Controls
-          terrainSettings={terrainSettings}
+          meshName={meshName}
+          shadingMode={shadingMode}
+          showDebugVectors={showDebugVectors}
           lightSettings={lightSettings}
-          renderMode={renderMode}
           wireframeEnabled={wireframeEnabled}
-          onTerrainChange={updateTerrain}
+          onMeshNameChange={(name) => {
+            setMeshName(name);
+            rendererRef.current?.setMeshName(name);
+          }}
+          onShadingModeChange={(mode) => {
+            setShadingMode(mode);
+            rendererRef.current?.setShadingMode(mode);
+          }}
+          onDebugVectorsChange={(enabled) => {
+            setShowDebugVectors(enabled);
+            rendererRef.current?.setShowDebugVectors(enabled);
+          }}
           onLightChange={updateLight}
-          onRenderModeChange={handleRenderMode}
-          onWireframeChange={handleWireframe}
-          onRegenerate={handleRegenerate}
-          onResetCamera={handleResetCamera}
+          onMaterialChange={updateMaterial}
+          onWireframeChange={(enabled) => {
+            setWireframeEnabled(enabled);
+            rendererRef.current?.setWireframeEnabled(enabled);
+          }}
+          onResetCamera={() => rendererRef.current?.resetCamera()}
         />
       )}
 

@@ -1,5 +1,3 @@
-const RESOLUTION_OPTIONS = [64, 96, 128, 160, 180, 224];
-
 function Slider({ label, value, min, max, step, onChange }) {
   return (
     <label className="control-row">
@@ -19,133 +17,158 @@ function Slider({ label, value, min, max, step, onChange }) {
   );
 }
 
+function RgbSliders({ label, rgb, onChange }) {
+  const channels = ['R', 'G', 'B'];
+  return (
+    <div className="rgb-group">
+      <span className="control-label">{label}</span>
+      {channels.map((ch, i) => (
+        <Slider
+          key={ch}
+          label={ch}
+          value={rgb[i]}
+          min={0}
+          max={1}
+          step={0.05}
+          onChange={(v) => {
+            const next = [...rgb];
+            next[i] = v;
+            onChange(next);
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
 export default function Controls({
-  terrainSettings,
+  meshName,
+  shadingMode,
+  showDebugVectors,
   lightSettings,
-  renderMode,
   wireframeEnabled,
-  onTerrainChange,
+  onMeshNameChange,
+  onShadingModeChange,
+  onDebugVectorsChange,
   onLightChange,
-  onRenderModeChange,
+  onMaterialChange,
   onWireframeChange,
-  onRegenerate,
   onResetCamera,
 }) {
+  const material = {
+    ambient: lightSettings.materialAmbient,
+    diffuse: lightSettings.materialDiffuse,
+    specular: lightSettings.materialSpecular,
+    shininess: lightSettings.shininess,
+  };
+
   return (
     <aside className="control-panel">
       <h2 className="panel-title">Controls</h2>
 
       <section className="panel-section">
-        <h3>Terrain</h3>
-        <Slider
-          label="Height"
-          value={terrainSettings.height}
-          min={5}
-          max={40}
-          step={1}
-          onChange={(v) => onTerrainChange({ height: v })}
-        />
-        <Slider
-          label="Noise Scale"
-          value={terrainSettings.noiseScale}
-          min={0.5}
-          max={6}
-          step={0.1}
-          onChange={(v) => onTerrainChange({ noiseScale: v })}
-        />
-        <Slider
-          label="Octaves"
-          value={terrainSettings.octaves}
-          min={1}
-          max={8}
-          step={1}
-          onChange={(v) => onTerrainChange({ octaves: v })}
-        />
-        <Slider
-          label="Water Level"
-          value={terrainSettings.waterLevel}
-          min={0}
-          max={0.5}
-          step={0.01}
-          onChange={(v) => onTerrainChange({ waterLevel: v })}
-        />
+        <h3>Mesh</h3>
         <label className="control-row">
-          <span className="control-label">Resolution</span>
-          <select
-            value={terrainSettings.resolution}
-            onChange={(e) => onTerrainChange({ resolution: parseInt(e.target.value, 10) })}
-          >
-            {RESOLUTION_OPTIONS.map((r) => (
-              <option key={r} value={r}>
-                {r} × {r}
-              </option>
-            ))}
+          <span className="control-label">Model</span>
+          <select value={meshName} onChange={(e) => onMeshNameChange(e.target.value)}>
+            <option value="sphere">Sphere</option>
+            <option value="test_cube">Cube</option>
           </select>
         </label>
-        <button type="button" className="btn" onClick={onRegenerate}>
-          Regenerate Terrain
-        </button>
+        <label className="control-row">
+          <span className="control-label">Shading</span>
+          <select value={shadingMode} onChange={(e) => onShadingModeChange(e.target.value)}>
+            <option value="flat">Flat (per-face)</option>
+            <option value="phong">Phong (per-pixel)</option>
+          </select>
+        </label>
       </section>
 
       <section className="panel-section">
-        <h3>Lighting</h3>
+        <h3>Point Light</h3>
         <Slider
-          label="Light X"
-          value={lightSettings.direction[0]}
-          min={-1}
-          max={1}
-          step={0.05}
-          onChange={(v) =>
-            onLightChange({ direction: [v, lightSettings.direction[1], lightSettings.direction[2]] })
-          }
-        />
-        <Slider
-          label="Light Y"
-          value={lightSettings.direction[1]}
-          min={-1}
-          max={0}
-          step={0.05}
-          onChange={(v) =>
-            onLightChange({ direction: [lightSettings.direction[0], v, lightSettings.direction[2]] })
-          }
-        />
-        <Slider
-          label="Light Z"
-          value={lightSettings.direction[2]}
-          min={-1}
-          max={1}
-          step={0.05}
-          onChange={(v) =>
-            onLightChange({ direction: [lightSettings.direction[0], lightSettings.direction[1], v] })
-          }
-        />
-        <Slider
-          label="Intensity"
-          value={lightSettings.intensity}
-          min={0.2}
-          max={2.5}
+          label="Position X"
+          value={lightSettings.position[0]}
+          min={-5}
+          max={5}
           step={0.1}
-          onChange={(v) => onLightChange({ intensity: v })}
+          onChange={(v) =>
+            onLightChange({ position: [v, lightSettings.position[1], lightSettings.position[2]] })
+          }
+        />
+        <Slider
+          label="Position Y"
+          value={lightSettings.position[1]}
+          min={-2}
+          max={8}
+          step={0.1}
+          onChange={(v) =>
+            onLightChange({ position: [lightSettings.position[0], v, lightSettings.position[2]] })
+          }
+        />
+        <Slider
+          label="Position Z"
+          value={lightSettings.position[2]}
+          min={-5}
+          max={5}
+          step={0.1}
+          onChange={(v) =>
+            onLightChange({ position: [lightSettings.position[0], lightSettings.position[1], v] })
+          }
+        />
+        <RgbSliders
+          label="Light Ambient"
+          rgb={lightSettings.ambient}
+          onChange={(rgb) => onLightChange({ ambient: rgb })}
+        />
+        <RgbSliders
+          label="Light Diffuse"
+          rgb={lightSettings.diffuse}
+          onChange={(rgb) => onLightChange({ diffuse: rgb })}
+        />
+        <RgbSliders
+          label="Light Specular"
+          rgb={lightSettings.specular}
+          onChange={(rgb) => onLightChange({ specular: rgb })}
+        />
+      </section>
+
+      <section className="panel-section">
+        <h3>Material</h3>
+        <RgbSliders
+          label="Ambient"
+          rgb={material.ambient}
+          onChange={(rgb) => onMaterialChange({ ambient: rgb })}
+        />
+        <RgbSliders
+          label="Diffuse"
+          rgb={material.diffuse}
+          onChange={(rgb) => onMaterialChange({ diffuse: rgb })}
+        />
+        <RgbSliders
+          label="Specular"
+          rgb={material.specular}
+          onChange={(rgb) => onMaterialChange({ specular: rgb })}
         />
         <Slider
           label="Shininess"
-          value={lightSettings.shininess}
+          value={material.shininess}
           min={2}
           max={128}
           step={1}
-          onChange={(v) => onLightChange({ shininess: v })}
+          onChange={(v) => onMaterialChange({ shininess: v })}
         />
       </section>
 
       <section className="panel-section">
         <h3>Rendering</h3>
-        <label className="control-row">
-          <span className="control-label">Render Mode</span>
-          <select value={renderMode} onChange={(e) => onRenderModeChange(e.target.value)}>
-            <option value="phong">Phong Terrain</option>
-            <option value="toon">Toon Terrain</option>
-            <option value="normal">Normal Visualization</option>
-          </select>
+        <label className="control-row checkbox-row">
+          <input
+            type="checkbox"
+            checked={showDebugVectors}
+            onChange={(e) => onDebugVectorsChange(e.target.checked)}
+          />
+          <span>Show light / reflection debug</span>
         </label>
         <label className="control-row checkbox-row">
           <input
@@ -153,7 +176,7 @@ export default function Controls({
             checked={wireframeEnabled}
             onChange={(e) => onWireframeChange(e.target.checked)}
           />
-          <span>Wireframe Overlay</span>
+          <span>Wireframe overlay</span>
         </label>
         <button type="button" className="btn btn-secondary" onClick={onResetCamera}>
           Reset Camera

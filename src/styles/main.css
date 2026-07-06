@@ -28,6 +28,7 @@ body,
   width: 100%;
   height: 100%;
   cursor: grab;
+  background: linear-gradient(180deg, #5a9fd4 0%, #3a6a94 60%, #2a4a64 100%);
 }
 
 .webgpu-canvas:active {
@@ -119,7 +120,21 @@ body,
 .control-label {
   display: flex;
   justify-content: space-between;
-  color: rgba(232, 236, 240, 0.7);
+  font-size: 0.78rem;
+  color: #a8b4c0;
+  margin-bottom: 4px;
+}
+
+.rgb-group {
+  margin-bottom: 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.rgb-group > .control-label {
+  font-weight: 500;
+  color: #c8d4e0;
+  margin-bottom: 6px;
 }
 
 .control-value {
@@ -225,6 +240,14 @@ select:focus {
 
 .status-bar .divider {
   opacity: 0.3;
+}
+
+.status-bar .status-error {
+  color: #ff6b6b;
+  max-width: 40vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Error overlay */

@@ -1,13 +1,66 @@
-import { TERRAIN_SHADER, WIREFRAME_SHADER, TRIANGLE_SHADER, RENDER_MODES } from './shaders.js';
-import { TerrainGenerator, TERRAIN_DEFAULTS } from '../terrain/TerrainGenerator.js';
+import { MESH_SHADER, MESH_WIREFRAME_SHADER, DEBUG_LINE_SHADER } from './shaders.js';
 import { OrbitCamera } from '../camera/OrbitCamera.js';
+import {
+  loadObjFromUrl,
+  createUVSphere,
+  computeMeshNormals,
+  computeBounds,
+} from '../mesh/MeshLoader.js';
+import { buildMeshGPUData } from '../mesh/MeshBuffer.js';
+import { buildLightReflectionDebugLines } from '../mesh/DebugLines.js';
+import {
+  DEFAULT_POINT_LIGHT,
+  DEFAULT_MATERIAL,
+  SHADING_MODES,
+} from '../lighting/defaults.js';
+import { vec3 } from 'gl-matrix';
 
-const UNIFORM_SIZE = 256;
+const UNIFORM_SIZE = 512;
 
-/**
- * WebGPU renderer for procedural terrain.
- * Manages GPU resources, render loop, and exposes imperative API for React UI.
- */
+const MESH_VERTEX_LAYOUT = {
+  arrayStride: 36,
+  attributes: [
+    { shaderLocation: 0, offset: 0, format: 'float32x3' },
+    { shaderLocation: 1, offset: 12, format: 'float32x3' },
+    { shaderLocation: 2, offset: 24, format: 'float32x3' },
+  ],
+};
+
+const DEPTH_STENCIL = {
+  format: 'depth24plus',
+  depthWriteEnabled: true,
+  depthCompare: 'less',
+};
+
+const MESH_MODELS = {
+  sphere: () => createUVSphere(10, 16, 1.0),
+  test_cube: () => loadObjFromUrl('/models/test_cube.obj'),
+  cube: () => loadObjFromUrl('/models/test_cube.obj'),
+};
+
+function mat4FromNormalMatrix(m3) {
+  return new Float32Array([
+    m3[0], m3[1], m3[2], 0,
+    m3[3], m3[4], m3[5], 0,
+    m3[6], m3[7], m3[8], 0,
+    0, 0, 0, 1,
+  ]);
+}
+
+async function logShaderErrors(module, label) {
+  const info = await module.getCompilationInfo();
+  const errors = info.messages.filter((m) => m.type === 'error');
+  for (const msg of errors) {
+    console.error(`WGSL ${label} [${msg.lineNum}:${msg.linePos}]:`, msg.message);
+  }
+  if (errors.length > 0) {
+    throw new Error(
+      `WGSL shader compile error (${label}) at line ${errors[0].lineNum}: ${errors[0].message}`,
+    );
+  }
+}
+
+/** WebGPU renderer for HW5 Phong mesh lighting. */
 export class WebGPURenderer {
   constructor(canvas) {
     this.canvas = canvas;
@@ -17,38 +70,48 @@ export class WebGPURenderer {
     this.depthTexture = null;
     this.depthView = null;
 
-    this.terrainPipeline = null;
-    this.wireframePipeline = null;
-    this.vertexBuffer = null;
-    this.indexBuffer = null;
-    this.wireIndexBuffer = null;
+    this.meshPipeline = null;
+    this.meshWirePipeline = null;
+    this.debugLinePipeline = null;
+
+    this.meshVertexBuffer = null;
+    this.meshIndexBuffer = null;
+    this.meshWireIndexBuffer = null;
+    this.debugVertexBuffer = null;
     this.uniformBuffer = null;
     this.bindGroup = null;
-    this.wireBindGroup = null;
 
-    this.terrain = null;
     this.camera = new OrbitCamera();
+    this.meshName = 'sphere';
+    this.mesh = null;
+    this.meshNormals = null;
+    this.meshGPU = null;
+    this.meshBounds = null;
 
-    this.terrainSettings = { ...TERRAIN_DEFAULTS };
     this.lightSettings = {
-      direction: [-0.4, -0.8, -0.3],
-      intensity: 1.2,
-      shininess: 48,
+      position: [...DEFAULT_POINT_LIGHT.position],
+      ambient: [...DEFAULT_POINT_LIGHT.ambient],
+      diffuse: [...DEFAULT_POINT_LIGHT.diffuse],
+      specular: [...DEFAULT_POINT_LIGHT.specular],
+      materialAmbient: [...DEFAULT_MATERIAL.ambient],
+      materialDiffuse: [...DEFAULT_MATERIAL.diffuse],
+      materialSpecular: [...DEFAULT_MATERIAL.specular],
+      shininess: DEFAULT_MATERIAL.shininess,
     };
-    this.renderMode = 'phong';
+    this.shadingMode = 'phong';
+    this.showDebugVectors = false;
     this.wireframeEnabled = false;
-    this.fogDensity = 1.0;
 
     this.running = false;
-    this.supported = false;
     this.error = null;
-    this.demoTriangle = true;
+    this._ready = false;
 
     this.stats = {
       fps: 0,
       vertexCount: 0,
       triangleCount: 0,
       renderMode: 'phong',
+      meshName: 'sphere',
       webgpuStatus: 'initializing',
     };
 
@@ -71,17 +134,29 @@ export class WebGPURenderer {
     }
 
     try {
-      const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      let adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
       if (!adapter) {
-        this.error = 'Failed to get WebGPU adapter.';
-        this.stats.webgpuStatus = 'unsupported';
-        this._notifyStats();
-        return false;
+        adapter = await navigator.gpu.requestAdapter({ forceFallbackAdapter: true });
+      }
+      if (!adapter) {
+        throw new Error(
+          'Failed to get WebGPU adapter. Enable hardware acceleration in Chrome/Edge settings.',
+        );
       }
 
       this.device = await adapter.requestDevice();
+      this.device.addEventListener('uncapturederror', (e) => {
+        console.error('WebGPU error:', e.error);
+        this.error = e.error?.message || String(e.error);
+        this.stats.webgpuStatus = 'error';
+        this._notifyStats();
+      });
+
       this.context = this.canvas.getContext('webgpu');
+      if (!this.context) throw new Error('Failed to get WebGPU canvas context.');
+
       this.format = navigator.gpu.getPreferredCanvasFormat();
+
       this.context.configure({
         device: this.device,
         format: this.format,
@@ -93,28 +168,24 @@ export class WebGPURenderer {
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       });
 
-      this._createPipelines();
-      this._resize();
+      await this._createPipelines();
       this.camera.attach(this.canvas);
-      this.camera.update();
-      this.camera.updateProjection(this.canvas.width / this.canvas.height);
+      await this._loadMesh(this.meshName);
+      this._fitCameraToMesh();
 
-      this.supported = true;
+      this._ready = true;
+      this._syncDepthToCanvas();
+      // Prime depth buffer size to match the swapchain before the render loop.
+      this._ensureDepthForTexture(this.context.getCurrentTexture());
+
       this.stats.webgpuStatus = 'ready';
+      this._notifyStats();
 
-      // Brief triangle demo to verify WebGPU, then switch to terrain.
-      this.demoTriangle = true;
-      this._createTrianglePipeline();
       this.running = true;
       this._startLoop();
-
-      setTimeout(() => {
-        this.demoTriangle = false;
-        this._buildTerrain();
-      }, 1200);
-
       return true;
     } catch (err) {
+      console.error('WebGPU init failed:', err);
       this.error = err.message || 'WebGPU initialization failed.';
       this.stats.webgpuStatus = 'error';
       this._notifyStats();
@@ -122,71 +193,49 @@ export class WebGPURenderer {
     }
   }
 
-  _createTrianglePipeline() {
-    const module = this.device.createShaderModule({ code: TRIANGLE_SHADER });
-    this.trianglePipeline = this.device.createRenderPipeline({
-      layout: 'auto',
-      vertex: { module, entryPoint: 'vs_triangle' },
-      fragment: {
-        module,
-        entryPoint: 'fs_triangle',
-        targets: [{ format: this.format }],
-      },
-      primitive: { topology: 'triangle-list' },
-      depthStencil: {
-        format: 'depth24plus',
-        depthWriteEnabled: true,
-        depthCompare: 'less',
-      },
-    });
-  }
+  async _createPipelines() {
+    const meshModule = this.device.createShaderModule({ code: MESH_SHADER });
+    const wireModule = this.device.createShaderModule({ code: MESH_WIREFRAME_SHADER });
+    const debugModule = this.device.createShaderModule({ code: DEBUG_LINE_SHADER });
 
-  _createPipelines() {
-    const terrainModule = this.device.createShaderModule({ code: TERRAIN_SHADER });
-    const wireModule = this.device.createShaderModule({ code: WIREFRAME_SHADER });
-
-    const vertexLayout = {
-      arrayStride: 36,
-      attributes: [
-        { shaderLocation: 0, offset: 0, format: 'float32x3' },
-        { shaderLocation: 1, offset: 12, format: 'float32x3' },
-        { shaderLocation: 2, offset: 24, format: 'float32x3' },
-      ],
-    };
-
-    const depthStencil = {
-      format: 'depth24plus',
-      depthWriteEnabled: true,
-      depthCompare: 'less',
-    };
+    await Promise.all([
+      logShaderErrors(meshModule, 'mesh'),
+      logShaderErrors(wireModule, 'wire'),
+      logShaderErrors(debugModule, 'debug'),
+    ]);
 
     const bindGroupLayout = this.device.createBindGroupLayout({
-      entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } }],
+      entries: [{
+        binding: 0,
+        visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT,
+        buffer: { type: 'uniform', minBindingSize: UNIFORM_SIZE },
+      }],
+    });
+    const pipelineLayout = this.device.createPipelineLayout({
+      bindGroupLayouts: [bindGroupLayout],
     });
 
-    const pipelineLayout = this.device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] });
-
-    this.terrainPipeline = this.device.createRenderPipeline({
+    this.meshPipeline = this.device.createRenderPipeline({
       layout: pipelineLayout,
       vertex: {
-        module: terrainModule,
-        entryPoint: 'vs_main',
-        buffers: [vertexLayout],
+        module: meshModule,
+        entryPoint: 'vs_mesh',
+        buffers: [MESH_VERTEX_LAYOUT],
       },
       fragment: {
-        module: terrainModule,
-        entryPoint: 'fs_main',
+        module: meshModule,
+        entryPoint: 'fs_mesh',
         targets: [{ format: this.format }],
       },
-      primitive: { topology: 'triangle-list', cullMode: 'back' },
-      depthStencil,
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      depthStencil: DEPTH_STENCIL,
     });
 
-    this.wireframePipeline = this.device.createRenderPipeline({
+    this.meshWirePipeline = this.device.createRenderPipeline({
       layout: pipelineLayout,
       vertex: {
         module: wireModule,
-        entryPoint: 'vs_wire',
+        entryPoint: 'vs_mesh_wire',
         buffers: [{
           arrayStride: 36,
           attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }],
@@ -194,7 +243,7 @@ export class WebGPURenderer {
       },
       fragment: {
         module: wireModule,
-        entryPoint: 'fs_wire',
+        entryPoint: 'fs_mesh_wire',
         targets: [{
           format: this.format,
           blend: {
@@ -204,135 +253,245 @@ export class WebGPURenderer {
         }],
       },
       primitive: { topology: 'line-list' },
-      depthStencil: { ...depthStencil, depthWriteEnabled: false },
+      depthStencil: { ...DEPTH_STENCIL, depthWriteEnabled: false },
+    });
+
+    this.debugLinePipeline = this.device.createRenderPipeline({
+      layout: pipelineLayout,
+      vertex: {
+        module: debugModule,
+        entryPoint: 'vs_debug',
+        buffers: [{
+          arrayStride: 24,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'float32x3' },
+            { shaderLocation: 1, offset: 12, format: 'float32x3' },
+          ],
+        }],
+      },
+      fragment: {
+        module: debugModule,
+        entryPoint: 'fs_debug',
+        targets: [{ format: this.format }],
+      },
+      primitive: { topology: 'line-list' },
+      depthStencil: { ...DEPTH_STENCIL, depthWriteEnabled: false },
     });
 
     this.bindGroup = this.device.createBindGroup({
       layout: bindGroupLayout,
       entries: [{ binding: 0, resource: { buffer: this.uniformBuffer } }],
     });
-    this.wireBindGroup = this.bindGroup;
   }
 
-  _buildTerrain() {
-    this.terrain = new TerrainGenerator(this.terrainSettings);
-    const vertices = this.terrain.getInterleavedVertices();
-    const indices = this.terrain.indices;
-    const wireIndices = this.terrain.wireIndices;
+  async _loadMesh(name) {
+    const loader = MESH_MODELS[name];
+    if (!loader) throw new Error(`Unknown mesh: ${name}`);
 
-    if (this.vertexBuffer) this.vertexBuffer.destroy();
-    if (this.indexBuffer) this.indexBuffer.destroy();
-    if (this.wireIndexBuffer) this.wireIndexBuffer.destroy();
+    this.mesh = await loader();
+    this.meshNormals = computeMeshNormals(this.mesh);
+    this.meshGPU = buildMeshGPUData(this.mesh, this.meshNormals);
+    this.meshBounds = computeBounds(this.mesh);
+    this.meshName = name;
 
-    this.vertexBuffer = this.device.createBuffer({
-      size: vertices.byteLength,
+    if (this.meshVertexBuffer) this.meshVertexBuffer.destroy();
+    if (this.meshIndexBuffer) this.meshIndexBuffer.destroy();
+    if (this.meshWireIndexBuffer) this.meshWireIndexBuffer.destroy();
+
+    const verts = this.meshGPU.interleavedVertices;
+    this.meshVertexBuffer = this.device.createBuffer({
+      size: verts.byteLength,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       mappedAtCreation: true,
     });
-    new Float32Array(this.vertexBuffer.getMappedRange()).set(vertices);
-    this.vertexBuffer.unmap();
+    new Float32Array(this.meshVertexBuffer.getMappedRange()).set(verts);
+    this.meshVertexBuffer.unmap();
 
-    this.indexBuffer = this.device.createBuffer({
-      size: indices.byteLength,
+    this.meshIndexBuffer = this.device.createBuffer({
+      size: this.meshGPU.indices.byteLength,
       usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
       mappedAtCreation: true,
     });
-    new Uint32Array(this.indexBuffer.getMappedRange()).set(indices);
-    this.indexBuffer.unmap();
+    new Uint16Array(this.meshIndexBuffer.getMappedRange()).set(this.meshGPU.indices);
+    this.meshIndexBuffer.unmap();
 
-    this.wireIndexBuffer = this.device.createBuffer({
-      size: wireIndices.byteLength,
+    this.meshWireIndexBuffer = this.device.createBuffer({
+      size: this.meshGPU.wireIndices.byteLength,
       usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
       mappedAtCreation: true,
     });
-    new Uint32Array(this.wireIndexBuffer.getMappedRange()).set(wireIndices);
-    this.wireIndexBuffer.unmap();
+    new Uint16Array(this.meshWireIndexBuffer.getMappedRange()).set(this.meshGPU.wireIndices);
+    this.meshWireIndexBuffer.unmap();
 
-    const stats = this.terrain.getStats();
-    this.stats.vertexCount = stats.vertexCount;
-    this.stats.triangleCount = stats.triangleCount;
+    this.stats.vertexCount = this.meshGPU.vertexCount;
+    this.stats.triangleCount = this.meshGPU.triangleCount;
+    this.stats.meshName = name;
     this._notifyStats();
   }
 
-  _resize() {
+  _fitCameraToMesh() {
+    if (!this.meshBounds) return;
+    const { center, radius } = this.meshBounds;
+    vec3.set(this.camera.target, center[0], center[1], center[2]);
+    this.camera.distance = Math.max(radius * 3.5, 2.5);
+    this.camera.minDistance = Math.max(radius * 0.5, 0.5);
+    this.camera.maxDistance = Math.max(radius * 12, 20);
+    this.camera.update();
+    this._updateProjection();
+  }
+
+  _updateProjection() {
+    const w = Math.max(this.canvas.clientWidth, 1);
+    const h = Math.max(this.canvas.clientHeight, 1);
+    this.camera.updateProjection(w / h, Math.PI / 4, 0.1, 100);
+  }
+
+  _syncDepthToCanvas() {
+    if (!this.device || !this.context) return;
+
     const dpr = window.devicePixelRatio || 1;
-    const width = Math.floor(this.canvas.clientWidth * dpr);
-    const height = Math.floor(this.canvas.clientHeight * dpr);
-    if (this.canvas.width === width && this.canvas.height === height) return;
-    if (width < 1 || height < 1) return;
+    const cssW = Math.max(this.canvas.clientWidth, 1);
+    const cssH = Math.max(this.canvas.clientHeight, 1);
+    const width = Math.max(1, Math.floor(cssW * dpr));
+    const height = Math.max(1, Math.floor(cssH * dpr));
 
-    this.canvas.width = width;
-    this.canvas.height = height;
-
-    if (this.depthTexture) this.depthTexture.destroy();
-    this.depthTexture = this.device.createTexture({
-      size: [width, height],
-      format: 'depth24plus',
-      usage: GPUTextureUsage.RENDER_ATTACHMENT,
-    });
-    this.depthView = this.depthTexture.createView();
-
-    if (this.context && this.device) {
+    if (this.canvas.width !== width || this.canvas.height !== height) {
+      this.canvas.width = width;
+      this.canvas.height = height;
       this.context.configure({
         device: this.device,
         format: this.format,
         alphaMode: 'opaque',
       });
-      this.camera.updateProjection(width / height);
+      this._updateProjection();
     }
   }
 
-  _updateUniforms(time) {
+  _ensureDepthForTexture(colorTexture) {
+    const w = colorTexture.width;
+    const h = colorTexture.height;
+    if (this.depthTexture
+      && this.depthTexture.width === w
+      && this.depthTexture.height === h) {
+      return;
+    }
+    if (this.depthTexture) this.depthTexture.destroy();
+    this.depthTexture = this.device.createTexture({
+      size: [w, h],
+      format: 'depth24plus',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    this.depthView = this.depthTexture.createView();
+  }
+
+  _resize() {
+    if (!this._ready) return;
+    this._syncDepthToCanvas();
+  }
+
+  _updateUniforms() {
     this.camera.update();
     const { model, view, projection, normal, position } = this.camera.modelViewProjection;
-
+    const ls = this.lightSettings;
     const data = new Float32Array(UNIFORM_SIZE / 4);
+
     data.set(model, 0);
     data.set(view, 16);
     data.set(projection, 32);
+    data.set(mat4FromNormalMatrix(normal), 48);
 
-    // Normal matrix stored as mat4x4 (3x3 in upper-left)
-    const nm = normal;
-    data[48] = nm[0]; data[49] = nm[1]; data[50] = nm[2];
-    data[52] = nm[3]; data[53] = nm[4]; data[54] = nm[5];
-    data[56] = nm[6]; data[57] = nm[7]; data[58] = nm[8];
+    data[64] = position[0];
+    data[65] = position[1];
+    data[66] = position[2];
 
-    data[60] = position[0];
-    data[61] = position[1];
-    data[62] = position[2];
+    data[68] = ls.position[0];
+    data[69] = ls.position[1];
+    data[70] = ls.position[2];
 
-    const ld = this.lightSettings.direction;
-    const len = Math.sqrt(ld[0] ** 2 + ld[1] ** 2 + ld[2] ** 2) || 1;
-    data[64] = ld[0] / len;
-    data[65] = ld[1] / len;
-    data[66] = ld[2] / len;
+    data[72] = ls.ambient[0];
+    data[73] = ls.ambient[1];
+    data[74] = ls.ambient[2];
 
-    data[68] = this.lightSettings.intensity;
-    data[69] = this.lightSettings.shininess;
-    data[70] = RENDER_MODES[this.renderMode] ?? 0;
-    data[71] = this.terrainSettings.waterLevel;
+    data[76] = ls.diffuse[0];
+    data[77] = ls.diffuse[1];
+    data[78] = ls.diffuse[2];
 
-    data[72] = this.fogDensity;
-    data[73] = time;
-    data[74] = this.terrainSettings.height;
+    data[80] = ls.specular[0];
+    data[81] = ls.specular[1];
+    data[82] = ls.specular[2];
+
+    data[84] = ls.materialAmbient[0];
+    data[85] = ls.materialAmbient[1];
+    data[86] = ls.materialAmbient[2];
+
+    data[88] = ls.materialDiffuse[0];
+    data[89] = ls.materialDiffuse[1];
+    data[90] = ls.materialDiffuse[2];
+
+    data[92] = ls.materialSpecular[0];
+    data[93] = ls.materialSpecular[1];
+    data[94] = ls.materialSpecular[2];
+
+    data[96] = ls.shininess;
+    data[97] = SHADING_MODES[this.shadingMode] ?? 1;
 
     this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
   }
 
-  _render(time) {
-    if (!this.device || !this.running) return;
+  _buildDebugBuffer() {
+    if (!this.showDebugVectors || !this.mesh || !this.meshNormals || !this.meshBounds) return 0;
 
-    this._resize();
+    const lineLen = this.meshBounds.radius * 0.45;
+    const { model } = this.camera.modelViewProjection;
+    const debug = buildLightReflectionDebugLines(
+      this.mesh,
+      this.meshNormals,
+      model,
+      { position: this.lightSettings.position },
+      lineLen,
+    );
+    if (debug.vertexCount === 0) return 0;
+
+    const interleaved = new Float32Array(debug.vertexCount * 6);
+    for (let i = 0; i < debug.vertexCount; i++) {
+      interleaved[i * 6] = debug.positions[i * 3];
+      interleaved[i * 6 + 1] = debug.positions[i * 3 + 1];
+      interleaved[i * 6 + 2] = debug.positions[i * 3 + 2];
+      interleaved[i * 6 + 3] = debug.colors[i * 3];
+      interleaved[i * 6 + 4] = debug.colors[i * 3 + 1];
+      interleaved[i * 6 + 5] = debug.colors[i * 3 + 2];
+    }
+
+    if (this.debugVertexBuffer) this.debugVertexBuffer.destroy();
+    this.debugVertexBuffer = this.device.createBuffer({
+      size: interleaved.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
+    });
+    new Float32Array(this.debugVertexBuffer.getMappedRange()).set(interleaved);
+    this.debugVertexBuffer.unmap();
+    return debug.vertexCount;
+  }
+
+  _render() {
+    if (!this.device || !this.running || !this.meshGPU) return;
+
+    this._syncDepthToCanvas();
+
+    this._updateUniforms();
+    const debugCount = this.showDebugVectors ? this._buildDebugBuffer() : 0;
+
+    const colorTexture = this.context.getCurrentTexture();
+    this._ensureDepthForTexture(colorTexture);
     if (!this.depthView) return;
-    this._updateUniforms(time);
 
     const encoder = this.device.createCommandEncoder();
-    const textureView = this.context.getCurrentTexture().createView();
+    const textureView = colorTexture.createView();
 
     const pass = encoder.beginRenderPass({
       colorAttachments: [{
         view: textureView,
-        clearValue: { r: 0.45, g: 0.62, b: 0.82, a: 1 },
+        clearValue: { r: 0.15, g: 0.17, b: 0.22, a: 1 },
         loadOp: 'clear',
         storeOp: 'store',
       }],
@@ -344,23 +503,25 @@ export class WebGPURenderer {
       },
     });
 
-    if (this.demoTriangle) {
-      pass.setPipeline(this.trianglePipeline);
-      pass.draw(3);
-    } else if (this.terrain && this.vertexBuffer) {
-      pass.setPipeline(this.terrainPipeline);
-      pass.setBindGroup(0, this.bindGroup);
-      pass.setVertexBuffer(0, this.vertexBuffer);
-      pass.setIndexBuffer(this.indexBuffer, 'uint32');
-      pass.drawIndexed(this.terrain.indices.length);
+    pass.setPipeline(this.meshPipeline);
+    pass.setBindGroup(0, this.bindGroup);
+    pass.setVertexBuffer(0, this.meshVertexBuffer);
+    pass.setIndexBuffer(this.meshIndexBuffer, 'uint16');
+    pass.drawIndexed(this.meshGPU.indices.length);
 
-      if (this.wireframeEnabled) {
-        pass.setPipeline(this.wireframePipeline);
-        pass.setBindGroup(0, this.wireBindGroup);
-        pass.setVertexBuffer(0, this.vertexBuffer);
-        pass.setIndexBuffer(this.wireIndexBuffer, 'uint32');
-        pass.drawIndexed(this.terrain.wireIndices.length);
-      }
+    if (this.wireframeEnabled) {
+      pass.setPipeline(this.meshWirePipeline);
+      pass.setBindGroup(0, this.bindGroup);
+      pass.setVertexBuffer(0, this.meshVertexBuffer);
+      pass.setIndexBuffer(this.meshWireIndexBuffer, 'uint16');
+      pass.drawIndexed(this.meshGPU.wireIndices.length);
+    }
+
+    if (debugCount > 0 && this.debugVertexBuffer) {
+      pass.setPipeline(this.debugLinePipeline);
+      pass.setBindGroup(0, this.bindGroup);
+      pass.setVertexBuffer(0, this.debugVertexBuffer);
+      pass.draw(debugCount);
     }
 
     pass.end();
@@ -377,54 +538,62 @@ export class WebGPURenderer {
   }
 
   _startLoop() {
-    const loop = (time) => {
+    const loop = () => {
       if (!this.running) return;
-      this._render(time * 0.001);
+      try {
+        this._render();
+      } catch (err) {
+        console.error('Render error:', err);
+        this.error = err.message || String(err);
+        this.stats.webgpuStatus = 'error';
+        this.running = false;
+        this._notifyStats();
+      }
       this._animationId = requestAnimationFrame(loop);
     };
     this._animationId = requestAnimationFrame(loop);
   }
 
   _notifyStats() {
-    this.stats.renderMode = this.renderMode;
+    this.stats.renderMode = this.shadingMode;
+    this.stats.errorMessage = this.error || '';
     if (this._onStatsUpdate) this._onStatsUpdate({ ...this.stats });
   }
 
-  setTerrainSettings(settings) {
-    const needsRegen = ['size', 'height', 'noiseScale', 'octaves', 'waterLevel', 'resolution']
-      .some((key) => settings[key] !== undefined && settings[key] !== this.terrainSettings[key]);
+  async setMeshName(name) {
+    if (!MESH_MODELS[name] || !this.device) return;
+    await this._loadMesh(name);
+    this._fitCameraToMesh();
+  }
 
-    Object.assign(this.terrainSettings, settings);
-
-    if (needsRegen && this.device && !this.demoTriangle) {
-      this._buildTerrain();
+  setShadingMode(mode) {
+    if (mode === 'flat' || mode === 'phong') {
+      this.shadingMode = mode;
+      this._notifyStats();
     }
+  }
+
+  setShowDebugVectors(enabled) {
+    this.showDebugVectors = enabled;
   }
 
   setLightSettings(settings) {
     Object.assign(this.lightSettings, settings);
   }
 
-  setRenderMode(mode) {
-    if (RENDER_MODES[mode] !== undefined) {
-      this.renderMode = mode;
-      this.stats.renderMode = mode;
-      this._notifyStats();
-    }
+  setMaterialSettings(settings) {
+    if (settings.ambient) this.lightSettings.materialAmbient = [...settings.ambient];
+    if (settings.diffuse) this.lightSettings.materialDiffuse = [...settings.diffuse];
+    if (settings.specular) this.lightSettings.materialSpecular = [...settings.specular];
+    if (settings.shininess !== undefined) this.lightSettings.shininess = settings.shininess;
   }
 
   setWireframeEnabled(enabled) {
     this.wireframeEnabled = enabled;
   }
 
-  regenerateTerrain() {
-    if (this.device && !this.demoTriangle) {
-      this._buildTerrain();
-    }
-  }
-
   resetCamera() {
-    this.camera.reset();
+    this._fitCameraToMesh();
   }
 
   resize() {
@@ -435,11 +604,16 @@ export class WebGPURenderer {
     this.running = false;
     if (this._animationId) cancelAnimationFrame(this._animationId);
     this.camera.detach();
-    if (this.vertexBuffer) this.vertexBuffer.destroy();
-    if (this.indexBuffer) this.indexBuffer.destroy();
-    if (this.wireIndexBuffer) this.wireIndexBuffer.destroy();
+    if (this.meshVertexBuffer) this.meshVertexBuffer.destroy();
+    if (this.meshIndexBuffer) this.meshIndexBuffer.destroy();
+    if (this.meshWireIndexBuffer) this.meshWireIndexBuffer.destroy();
+    if (this.debugVertexBuffer) this.debugVertexBuffer.destroy();
     if (this.uniformBuffer) this.uniformBuffer.destroy();
     if (this.depthTexture) this.depthTexture.destroy();
+    if (this.context) this.context.unconfigure();
     if (this.device) this.device.destroy();
+    this.device = null;
+    this.context = null;
+    this.depthView = null;
   }
 }
