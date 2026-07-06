@@ -122,7 +122,9 @@ export default function App() {
           wireframeEnabled={wireframeEnabled}
           onMeshNameChange={(name) => {
             setMeshName(name);
-            rendererRef.current?.setMeshName(name);
+            rendererRef.current?.setMeshName(name).catch(() => {
+              // Error surfaced via renderer stats / overlay.
+            });
           }}
           onShadingModeChange={(mode) => {
             setShadingMode(mode);

@@ -37,7 +37,8 @@ export class OrbitCamera {
   }
 
   updateProjection(aspect, fov = Math.PI / 4, near = 0.1, far = 100) {
-    mat4.perspectiveZO(this.projectionMatrix, fov, aspect, near, far);
+    const safeAspect = Math.max(aspect, 1e-6);
+    mat4.perspectiveZO(this.projectionMatrix, fov, safeAspect, near, far);
     // WebGPU clip-space Y points down (unlike OpenGL).
     this.projectionMatrix[5] *= -1;
   }
@@ -60,7 +61,7 @@ export class OrbitCamera {
 
   attach(canvas) {
     this._canvas = canvas;
-    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    canvas.addEventListener('contextmenu', this._onContextMenu);
     canvas.addEventListener('mousedown', this._onMouseDown);
     canvas.addEventListener('mousemove', this._onMouseMove);
     canvas.addEventListener('mouseup', this._onMouseUp);
@@ -69,8 +70,10 @@ export class OrbitCamera {
   }
 
   detach() {
+    this._onMouseUp();
     if (!this._canvas) return;
     const canvas = this._canvas;
+    canvas.removeEventListener('contextmenu', this._onContextMenu);
     canvas.removeEventListener('mousedown', this._onMouseDown);
     canvas.removeEventListener('mousemove', this._onMouseMove);
     canvas.removeEventListener('mouseup', this._onMouseUp);
@@ -78,6 +81,8 @@ export class OrbitCamera {
     canvas.removeEventListener('wheel', this._onWheel);
     this._canvas = null;
   }
+
+  _onContextMenu = (e) => e.preventDefault();
 
   _onMouseDown = (e) => {
     this._isDragging = true;

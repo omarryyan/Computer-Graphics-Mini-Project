@@ -41,6 +41,11 @@ export function buildMeshGPUData(mesh, normals) {
     wireIndices.push(base, base + 1, base + 1, base + 2, base + 2, base);
   }
 
+  const vertexCount = triCount * 3;
+  if (vertexCount > 65535) {
+    throw new Error(`Mesh has ${vertexCount} vertices; uint16 indices only support up to 65535.`);
+  }
+
   return {
     interleavedVertices: interleaved,
     indices: (() => {

@@ -180,6 +180,15 @@ export function createUVSphere(stacks = 10, slices = 16, radius = 1.0) {
 }
 
 export function computeBounds(mesh) {
+  if (mesh.vertices.length === 0) {
+    return {
+      min: [0, 0, 0],
+      max: [0, 0, 0],
+      center: [0, 0, 0],
+      radius: 1,
+    };
+  }
+
   let minX = Infinity;
   let minY = Infinity;
   let minZ = Infinity;

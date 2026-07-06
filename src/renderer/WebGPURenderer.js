@@ -119,6 +119,7 @@ export class WebGPURenderer {
     this._lastFpsTime = performance.now();
     this._animationId = null;
     this._onStatsUpdate = null;
+    this._debugVertexCapacity = 0;
   }
 
   onStatsUpdate(callback) {
@@ -147,9 +148,11 @@ export class WebGPURenderer {
       this.device = await adapter.requestDevice();
       this.device.addEventListener('uncapturederror', (e) => {
         console.error('WebGPU error:', e.error);
-        this.error = e.error?.message || String(e.error);
-        this.stats.webgpuStatus = 'error';
-        this._notifyStats();
+        this._setError(e.error?.message || String(e.error));
+      });
+      this.device.lost.then((info) => {
+        console.error('WebGPU device lost:', info.message);
+        this._setError(`WebGPU device lost: ${info.message}`);
       });
 
       this.context = this.canvas.getContext('webgpu');
@@ -170,6 +173,12 @@ export class WebGPURenderer {
 
       await this._createPipelines();
       this.camera.attach(this.canvas);
+
+      // Wait for layout so the canvas and depth buffer have valid dimensions.
+      for (let i = 0; i < 120 && this.canvas.clientWidth < 1; i++) {
+        await new Promise((resolve) => requestAnimationFrame(resolve));
+      }
+
       await this._loadMesh(this.meshName);
       this._fitCameraToMesh();
 
@@ -186,9 +195,7 @@ export class WebGPURenderer {
       return true;
     } catch (err) {
       console.error('WebGPU init failed:', err);
-      this.error = err.message || 'WebGPU initialization failed.';
-      this.stats.webgpuStatus = 'error';
-      this._notifyStats();
+      this._setError(err.message || 'WebGPU initialization failed.');
       return false;
     }
   }
@@ -285,6 +292,8 @@ export class WebGPURenderer {
   }
 
   async _loadMesh(name) {
+    if (!this.device) return;
+
     const loader = MESH_MODELS[name];
     if (!loader) throw new Error(`Unknown mesh: ${name}`);
 
@@ -432,10 +441,17 @@ export class WebGPURenderer {
     data[93] = ls.materialSpecular[1];
     data[94] = ls.materialSpecular[2];
 
-    data[96] = ls.shininess;
+    data[96] = Math.max(1, ls.shininess);
     data[97] = SHADING_MODES[this.shadingMode] ?? 1;
 
-    this.device.queue.writeBuffer(this.uniformBuffer, 0, data);
+    this.device.queue.writeBuffer(this.uniformBuffer, 0, data.buffer, data.byteOffset, UNIFORM_SIZE);
+  }
+
+  _setError(message) {
+    this.error = message;
+    this.stats.webgpuStatus = 'error';
+    this.running = false;
+    this._notifyStats();
   }
 
   _buildDebugBuffer() {
@@ -462,15 +478,21 @@ export class WebGPURenderer {
       interleaved[i * 6 + 5] = debug.colors[i * 3 + 2];
     }
 
-    if (this.debugVertexBuffer) this.debugVertexBuffer.destroy();
-    this.debugVertexBuffer = this.device.createBuffer({
-      size: interleaved.byteLength,
-      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-      mappedAtCreation: true,
-    });
-    new Float32Array(this.debugVertexBuffer.getMappedRange()).set(interleaved);
-    this.debugVertexBuffer.unmap();
+    this._uploadDebugVertices(interleaved);
     return debug.vertexCount;
+  }
+
+  _uploadDebugVertices(interleaved) {
+    const byteLength = interleaved.byteLength;
+    if (!this.debugVertexBuffer || this._debugVertexCapacity < byteLength) {
+      if (this.debugVertexBuffer) this.debugVertexBuffer.destroy();
+      this._debugVertexCapacity = byteLength;
+      this.debugVertexBuffer = this.device.createBuffer({
+        size: byteLength,
+        usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+      });
+    }
+    this.device.queue.writeBuffer(this.debugVertexBuffer, 0, interleaved);
   }
 
   _render() {
@@ -544,10 +566,8 @@ export class WebGPURenderer {
         this._render();
       } catch (err) {
         console.error('Render error:', err);
-        this.error = err.message || String(err);
-        this.stats.webgpuStatus = 'error';
-        this.running = false;
-        this._notifyStats();
+        this._setError(err.message || String(err));
+        return;
       }
       this._animationId = requestAnimationFrame(loop);
     };
@@ -562,8 +582,13 @@ export class WebGPURenderer {
 
   async setMeshName(name) {
     if (!MESH_MODELS[name] || !this.device) return;
-    await this._loadMesh(name);
-    this._fitCameraToMesh();
+    try {
+      await this._loadMesh(name);
+      this._fitCameraToMesh();
+    } catch (err) {
+      console.error('Failed to load mesh:', err);
+      this._setError(err.message || `Failed to load mesh: ${name}`);
+    }
   }
 
   setShadingMode(mode) {
@@ -608,6 +633,8 @@ export class WebGPURenderer {
     if (this.meshIndexBuffer) this.meshIndexBuffer.destroy();
     if (this.meshWireIndexBuffer) this.meshWireIndexBuffer.destroy();
     if (this.debugVertexBuffer) this.debugVertexBuffer.destroy();
+    this.debugVertexBuffer = null;
+    this._debugVertexCapacity = 0;
     if (this.uniformBuffer) this.uniformBuffer.destroy();
     if (this.depthTexture) this.depthTexture.destroy();
     if (this.context) this.context.unconfigure();
