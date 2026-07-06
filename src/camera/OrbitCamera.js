@@ -100,7 +100,7 @@ export class OrbitCamera {
 
     if (rotate) {
       this.azimuth -= dx * 0.005;
-      this.elevation += dy * 0.005;
+      this.elevation -= dy * 0.005;
       this.elevation = Math.max(this.minElevation, Math.min(this.maxElevation, this.elevation));
     } else if (pan) {
       const panSpeed = this.distance * 0.0015;
